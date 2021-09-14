@@ -1,189 +1,405 @@
-#![feature(proc_macro_hygiene, decl_macro)]
+//! # Error
+//!
+//! Because all endpoints make use of the underlying database they can all fail due to it.
+//! As such errors caused by the database are mostly undocumented. Instead endpoints will only provide
+//! an `Error` section if APi-specific errors can occur.
 
-#[macro_use]
-extern crate rocket;
+#[cfg(test)]
+mod tests;
 
-use rocket::http::Status;
-use rocket_contrib::json::Json;
-use serde_json::Value;
-use std::fs;
-use std::path::Path;
+use db_adapter::{
+    establish_connection,
+    guild::{GuildConfig, GuildConfigBuilder, GuildConfigError, Privilege},
+    slap::{GuildSlapRecord, MemberSlapRecord, SlapReport},
+    AdapterError, PgPool,
+};
+use dotenv::dotenv;
+use rocket::{
+    form::{Form, FromForm},
+    get,
+    http::ContentType,
+    http::Status,
+    post,
+    request::Request,
+    response::{self, Responder, Response},
+    routes,
+    serde::json::Json,
+    State,
+};
+use serenity::model::id::{GuildId, RoleId, UserId};
+use std::{io::Cursor, u64};
+use thiserror;
+use tokio_stream::StreamExt;
 
-const BASE_PATH: &str = "emulated/";
-const SERVER_PATH: &str = "emulated/servers/";
+type Pool = State<PgPool>;
 
-/// Returns the IDs of guilds handled by the bot.
-fn get_guilds() -> Vec<String> {
-    Path::new(SERVER_PATH)
-        .read_dir()
-        .expect("SERVER_PATH does not exist!")
-        .map(|file| {
-            file.expect("Could not read files in SERVER_PATH")
-                .file_name()
-                .into_string()
-                .unwrap() //the value written by python here is always UTF-8 valid
-                .split(".")
-                .next()
-                .unwrap() //there will always at least be one value in this collection, even if for some reason the filename did not contain a `.`
-                .to_string()
-        })
-        .collect()
+/// Wrapper around [`AdapterError`]
+#[derive(Debug, thiserror::Error)]
+enum ApiError {
+    #[error("We couldn't process your request: {reason}. Error: {source}")]
+    AdapterError {
+        status: Status,
+        reason: String,
+        #[source]
+        source: AdapterError,
+    },
+    #[error("expected on of: `admin`, `event` or `manager` found {0}")]
+    UnrecognizedPrivilege(String),
 }
 
-/// Returns an array sttrings of guild IDs. Each ID represents a guild handled by the bot.
-#[get("/")]
-pub fn server_all() -> Json<Value> {
-    Json(Value::Array(
-        get_guilds()
-            .iter()
-            .map(|id| Value::String(id.to_string()))
-            .collect(),
-    ))
-}
+impl<'a> From<AdapterError> for ApiError {
+    fn from(err: AdapterError) -> Self {
+        let (status, reason) = match &err {
+            AdapterError::SqlxError(_) => (
+                Status::InternalServerError,
+                "sqlx driver failed to query the database",
+            ),
+            AdapterError::GuildError(guild_error) => match guild_error {
+                GuildConfigError::AlreadyExists(_id) => {
+                    (Status::BadRequest, "guild already exists")
+                }
+                _ => todo!(),
+            },
+        };
 
-/// Returns a JSON bool denoting the existence of a config for this guild
-#[get("/server/<gid>")]
-pub fn server_one(gid: String) -> Json<bool> {
-    let mut file = String::from(gid);
-    file.push_str(".json");
-    Json(Path::new(SERVER_PATH).join(file).exists())
-}
-
-/// Returns the JSON config file for the specified guild
-#[get("/config/<gid>")]
-pub fn server_conf(gid: String) -> Option<Json<Value>> {
-    let mut path = String::from(SERVER_PATH);
-    path.push_str(&gid);
-    path.push_str(".json");
-    let contents = fs::read_to_string(path).ok()?;
-    Some(Json(serde_json::from_str(&contents).ok()?))
-}
-
-/// returns a JSON array of available languages for the bot
-#[get("/langs")]
-pub fn available_langs() -> Json<Value> {
-    let path = Path::new(BASE_PATH).join("settings.py");
-    let contents = fs::read_to_string(path).expect("settings.py is missing!");
-
-    println!("{:?}", contents);
-    let langs_line: Vec<_> = contents
-        .lines()
-        .filter(|line| line.starts_with("ALLOWED_LANGS"))
-        .collect();
-    println!("{:?}", langs_line);
-    assert_eq!(langs_line.len(), 1); //langs shouldn't be defined more than once
-    Json(
-        serde_json::from_str(langs_line[0].rsplit("=").next().unwrap())
-            .expect("Could not decode python list to json array!"),
-    )
-}
-
-/// Reloads the langs, currently not needed. Only here for backward-compatibility
-#[get("/reload")]
-fn reload_langs() -> Json<bool> {
-    Json(true)
-}
-
-/// attempts to update the config file for guild with id <gid>
-/// retuns different status codes depending on the results:
-///     200 if successful
-///     404 if <gid> is invalid
-///     304 if updating failed for some internal reason
-#[put("/update/<gid>", format = "json", data = "<conf>")]
-pub fn overwrite_conf(gid: String, conf: Json<serde_json::Value>) -> Status {
-    let path = Path::new(SERVER_PATH);
-    if !get_guilds().contains(&gid) {
-        return Status::NotFound;
-    } else {
-        match fs::write(path, conf.to_string()) {
-            Ok(_) => Status::Ok,
-            Err(_) => Status::NotModified,
+        ApiError::AdapterError {
+            status,
+            reason: reason.to_string(),
+            source: err,
         }
     }
 }
 
-pub fn get_rocket() -> rocket::Rocket {
-    rocket::ignite().mount(
-        "/",
-        routes![
-            server_one,
-            server_all,
-            server_conf,
-            available_langs,
-            overwrite_conf,
-            reload_langs
-        ],
-    )
+impl<'r, 'o: 'r> Responder<'r, 'o> for ApiError {
+    fn respond_to(self, _: &'r Request<'_>) -> response::Result<'o> {
+        let mut response = Response::build();
+        response.header(ContentType::Plain);
+        match self {
+            ApiError::AdapterError { status, reason, .. } => response
+                .status(status)
+                .sized_body(reason.len(), Cursor::new(reason)),
+            ApiError::UnrecognizedPrivilege(_) => response.status(Status::BadRequest),
+        };
+
+        response.ok()
+    }
 }
 
-fn main() {
-    get_rocket().launch();
+type ApiResult<T> = Result<T, ApiError>;
+
+#[rocket::main]
+async fn main() {
+    dotenv().ok();
+    rocket::build()
+        //TODO: try and optimise this since every call only requires &PgPool (ie: references)
+        .manage(establish_connection().await)
+        .mount(
+            "/",
+            routes![
+                gsr_len,
+                gsr_slaps,
+                gsr_offenders,
+                new_slap,
+                msr_len,
+                msr_slaps,
+                guild_admin_chan,
+                guild_advertise,
+                guild_exists,
+                guild_goodbye_message,
+                guild_has_privileges,
+                guild_privileges_for,
+                guild_roles_with,
+                guild_welcome_message,
+                guild_have_privilege,
+                guild_new,
+                guild_set_admin_chan,
+                guild_set_advertise,
+                guild_set_welcome_message,
+                guild_set_goodbye_message
+            ],
+        )
+        .launch()
+        .await
+        .unwrap();
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rocket::http::{ContentType, Status};
-    use rocket::local::Client;
-    use std::sync::Once;
+/// `GET` up to `number` [`SlapReport`] from the guild.
+///
+///Currently there's no way to stream all [`SlapReport`] from a guild so this is often used alongside
+///[`gsr_len()`]. Otherwise you may provide a very big `number` *should* give them all.
+///
+/// # Errors
+///
+/// Aside from failures from the underlying database, the request will fail if `number` is greater than
+/// either 2^32 or 2^64 depending on the platform.
+#[get("/slaps/<guild>/reports?<number>")]
+async fn gsr_slaps(guild: u64, number: usize, pool: &Pool) -> ApiResult<Json<Vec<SlapReport>>> {
+    Ok(Json(
+        GuildSlapRecord::from(GuildId(guild))
+            .slaps(pool.inner())
+            .take(number)
+            .collect::<Result<Vec<SlapReport>, AdapterError>>()
+            .await?,
+    ))
+}
 
-    static INIT: Once = Once::new();
-    fn setup_env() {
-        INIT.call_once(|| {
-            fs::create_dir_all(SERVER_PATH).expect("Couldn't setup environement");
-            fs::write(
-                Path::new(BASE_PATH).join("settings.py"),
-                "ALLOWED_LANGS = [\"en\",\"fr\"]",
+/// `GET` up to `number` [`UserId`] (`u64`) who were slapped in the guild.
+///
+///Currently there's no way to stream all [`UserId`] from a guild so this is often used alongside
+///[`gsr_offender_len`]. Otherwise you may provide a very big `number` *should* give them all.
+///
+/// # Errors
+///
+/// Aside from failures from the underlying database, the request will fail if `number` is greater than
+/// either 2^32 or 2^64 depending on the platform.
+#[get("/slaps/<guild>/offenders?<number>")]
+async fn gsr_offenders(guild: u64, number: usize, pool: &Pool) -> ApiResult<Json<Vec<u64>>> {
+    Ok(Json(
+        GuildSlapRecord::from(GuildId(guild))
+            .offenders(pool.inner())
+            .take(number)
+            .map(|res| res.map(|msr| msr.1 .0))
+            .collect::<Result<Vec<u64>, AdapterError>>()
+            .await?,
+    ))
+}
+
+/// `GET` the number of slaps in the guild
+#[get("/slaps/<guild>/len")]
+async fn gsr_len(pool: &Pool, guild: u64) -> ApiResult<Json<usize>> {
+    Ok(Json(
+        GuildSlapRecord::from(GuildId(guild))
+            .len(pool.inner())
+            .await?,
+    ))
+}
+
+#[derive(Debug, FromForm)]
+struct SlapForm {
+    guild: u64,
+    sentence: u64,
+    offender: u64,
+    enforcer: Option<u64>,
+    reason: Option<String>,
+}
+
+#[post("/slaps/new", data = "<slap>")]
+async fn new_slap(pool: &Pool, slap: Form<SlapForm>) -> ApiResult<Json<SlapReport>> {
+    let gsr = GuildSlapRecord(slap.guild.into());
+    Ok(Json(
+        gsr.new_slap(
+            pool.inner(),
+            slap.sentence.into(),
+            slap.offender.into(),
+            slap.enforcer.into(),
+            slap.reason.as_ref(),
+        )
+        .await?,
+    ))
+}
+
+/// `GET` the number of slaps in the guild for `member` ([`UserId`])
+#[get("/slaps/<guild>/<member>/len")]
+async fn msr_len(pool: &Pool, guild: u64, member: u64) -> ApiResult<Json<usize>> {
+    Ok(Json(
+        MemberSlapRecord::from((GuildId(guild), UserId(member)))
+            .len(pool.inner())
+            .await?,
+    ))
+}
+
+#[get("/slaps/<guild>/<member>/reports?<number>")]
+async fn msr_slaps(
+    guild: u64,
+    member: u64,
+    number: usize,
+    pool: &Pool,
+) -> ApiResult<Json<Vec<SlapReport>>> {
+    Ok(Json(
+        MemberSlapRecord::from((GuildId(guild), UserId(member)))
+            .slaps(pool.inner())
+            .take(number)
+            .collect::<Result<Vec<SlapReport>, AdapterError>>()
+            .await?,
+    ))
+}
+
+#[get("/guild/<guild>/exists")]
+async fn guild_exists(pool: &Pool, guild: u64) -> ApiResult<Json<bool>> {
+    Ok(Json(GuildConfig(guild.into()).exists(pool.inner()).await?))
+}
+
+#[get("/guild/<guild>/admin_channel")]
+async fn guild_admin_chan(pool: &Pool, guild: u64) -> ApiResult<Json<Option<u64>>> {
+    Ok(Json(
+        GuildConfig(guild.into())
+            .get_admin_chan(pool.inner())
+            .await?
+            .map(|chan_id| chan_id.into()),
+    ))
+}
+
+#[get("/guild/<guild>/advertise")]
+async fn guild_advertise(pool: &Pool, guild: u64) -> ApiResult<Json<bool>> {
+    Ok(Json(
+        GuildConfig(guild.into())
+            .get_advertise(pool.inner())
+            .await?,
+    ))
+}
+
+#[get("/guild/<guild>/goodbye_message")]
+async fn guild_goodbye_message(pool: &Pool, guild: u64) -> ApiResult<Json<Option<String>>> {
+    Ok(Json(
+        GuildConfig(guild.into())
+            .get_goodbye_message(pool.inner())
+            .await?,
+    ))
+}
+
+#[get("/guild/<guild>/welcome_message")]
+async fn guild_welcome_message(pool: &Pool, guild: u64) -> ApiResult<Json<Option<String>>> {
+    Ok(Json(
+        GuildConfig(guild.into())
+            .get_welcome_message(pool.inner())
+            .await?,
+    ))
+}
+
+#[get("/guild/<guild>/privileges/for_role/<role>")]
+async fn guild_privileges_for(pool: &Pool, guild: u64, role: u64) -> ApiResult<Json<Vec<String>>> {
+    let privs = GuildConfig(guild.into())
+        .get_privileges_for(pool.inner(), role.into())
+        .await?
+        .iter()
+        //consider finding a more optimized way to do this
+        .map(|privilege| privilege.as_ref().into())
+        .collect();
+    Ok(Json(privs))
+}
+
+//TODO: good candiadate for a TryInto impl -> see db-adapter
+fn str_to_priv(src: &str) -> ApiResult<Privilege> {
+    Ok(match src {
+        "admin" => Privilege::Admin,
+        "manager" => Privilege::Manager,
+        "event" => Privilege::Event,
+        _ => return Err(ApiError::UnrecognizedPrivilege(src.into())),
+    })
+}
+
+#[get("/guild/<guild>/privileges/roles_with/<privilege_str>")]
+async fn guild_roles_with(
+    pool: &Pool,
+    guild: u64,
+    privilege_str: &str,
+) -> ApiResult<Json<Vec<u64>>> {
+    Ok(Json(
+        GuildConfig(guild.into())
+            .get_roles_with(pool.inner(), str_to_priv(privilege_str)?)
+            .await?
+            .iter()
+            .map(|role| u64::from(*role))
+            .collect::<Vec<u64>>(),
+    ))
+}
+
+#[get("/guild/<guild>/privileges/has/<role>?<privileges_str>")]
+async fn guild_has_privileges(
+    pool: &Pool,
+    guild: u64,
+    role: u64,
+    privileges_str: Vec<String>,
+) -> ApiResult<Json<bool>> {
+    let mut privileges = Vec::with_capacity(privileges_str.len());
+    for string in privileges_str {
+        privileges.push(str_to_priv(string.as_str())?)
+    }
+    Ok(Json(
+        GuildConfig(guild.into())
+            .has_privileges(pool.inner(), role.into(), privileges.as_slice())
+            .await?,
+    ))
+}
+
+#[get("/guild/<guild>/privileges/have/<privilege_str>?<roles>")]
+async fn guild_have_privilege(
+    pool: &Pool,
+    guild: u64,
+    roles: Vec<u64>,
+    privilege_str: &str,
+) -> ApiResult<Json<bool>> {
+    Ok(Json(
+        GuildConfig(guild.into())
+            .have_privilege(
+                pool.inner(),
+                roles
+                    .iter()
+                    .map(|int| RoleId(*int))
+                    .collect::<Vec<RoleId>>()
+                    .as_slice(),
+                str_to_priv(privilege_str)?,
             )
-            .expect("Couldn't setup environement");
-            fs::write(Path::new(SERVER_PATH).join("54654564.json"), "{}")
-                .expect("Couldn't create server file");
-        })
+            .await?,
+    ))
+}
+
+#[derive(Debug, FromForm)]
+struct NewGuildForm {
+    id: u64,
+    welcome_message: Option<String>,
+    goodbye_message: Option<String>,
+    advertise: bool,
+}
+
+#[post("/guild/new", data = "<config>")]
+async fn guild_new<'a>(pool: &Pool, config: Form<NewGuildForm>) -> ApiResult<()> {
+    //consider moving some of this code into an `TryFrom` impl and call `into_inner` instead
+    let mut builder = GuildConfigBuilder::new(config.id.into());
+    builder.advertise(config.advertise);
+    if let Some(welcome) = &config.welcome_message {
+        builder.welcome_message(welcome.as_str())?;
+    }
+    if let Some(goodbye) = &config.goodbye_message {
+        builder.welcome_message(goodbye.as_str())?;
     }
 
-    #[test]
-    fn test_server_all() {
-        setup_env();
-        let client = Client::new(get_rocket()).expect("Got an invalid rocket instance");
-        let mut response = client.get("/").dispatch();
-        assert_eq!(response.content_type(), Some(ContentType::JSON));
-        assert_eq!(response.body_string(), Some(String::from("[\"54654564\"]")));
-    }
+    GuildConfig::new(pool.inner(), builder).await?;
+    Ok(())
+}
 
-    #[test]
-    fn test_server_one() {
-        setup_env();
-        let client = Client::new(get_rocket()).expect("Got an invalid rocket instance");
-        let mut response = client.get("/server/54654564").dispatch();
-        assert_eq!(response.body_string(), Some(String::from("true")));
-        let mut response = client.get("/server/wrong_id").dispatch();
-        assert_eq!(response.body_string(), Some(String::from("false")));
-    }
+#[post("/guild/<guild>/admin_channel", data = "<chan>")]
+async fn guild_set_admin_chan(pool: &Pool, guild: u64, chan: Form<Option<u64>>) -> ApiResult<()> {
+    Ok(GuildConfig(guild.into())
+        .set_admin_chan(pool.inner(), chan.into_inner().map(|int| int.into()))
+        .await?)
+}
 
-    #[test]
-    fn test_server_conf() {
-        setup_env();
-        let client = Client::new(get_rocket()).expect("Got an invalid rocket instance");
-        let mut response = client.get("/config/54654564").dispatch();
-        assert_eq!(response.body_string(), Some(String::from("{}")));
-    }
+#[post("/guild/<guild>/advertise", data = "<policy>")]
+async fn guild_set_advertise(pool: &Pool, guild: u64, policy: Form<bool>) -> ApiResult<()> {
+    Ok(GuildConfig(guild.into())
+        .set_advertise(pool.inner(), policy.into_inner())
+        .await?)
+}
 
-    #[test]
-    fn test_available_langs() {
-        setup_env();
-        let client = Client::new(get_rocket()).expect("Got an invalid rocket instance");
-        let mut response = client.get("/langs").dispatch();
-        assert_eq!(
-            response.body_string(),
-            Some(String::from("[\"en\",\"fr\"]"))
-        );
-    }
+#[post("/guild/<guild>/welcome_message", data = "<message>")]
+async fn guild_set_welcome_message(
+    pool: &Pool,
+    guild: u64,
+    message: Form<Option<&str>>,
+) -> ApiResult<()> {
+    Ok(GuildConfig(guild.into())
+        .set_welcome_message(pool.inner(), message.into_inner())
+        .await?)
+}
 
-    #[test]
-    fn test_overwrite_conf() {
-        setup_env();
-        let client = Client::new(get_rocket()).expect("Got an invalid rocket instance");
-        let mut response = client.put("/update/54654564").dispatch();
-        assert_eq!(response.status(), Status::Ok);
-    }
+#[post("/guild/<guild>/goodbye_message", data = "<message>")]
+async fn guild_set_goodbye_message(
+    pool: &Pool,
+    guild: u64,
+    message: Form<Option<&str>>,
+) -> ApiResult<()> {
+    Ok(GuildConfig(guild.into())
+        .set_goodbye_message(pool.inner(), message.into_inner())
+        .await?)
 }

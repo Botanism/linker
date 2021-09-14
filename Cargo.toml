@@ -1,17 +1,19 @@
+
 [package]
 name = "linker"
-version = "0.1.0"
+version = "0.0.0"
 authors = ["s0lst1ce <thithib.cohergne@gmail.com>"]
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-rocket = "0.4.4"
-serde = "1.0.110"
-serde_json = "1.0"
-
-[dependencies.rocket_contrib]
-version = "0.4.4"
-default-features = false
-features = ["json"]
+rocket = {version="0.5.0-rc.1", features=["json"]}
+serde = "1"
+serde_json = "1"
+serenity = {version="0.10", features=["model"]}
+#db-adapter = {git="https://github.com/Botanism/rust-db-adapter", branch="main", features=["net"]}
+db-adapter = {path="../db-adapter", features=["net"]}
+dotenv = "0.15"
+tokio-stream="0.1"
+thiserror="1"
